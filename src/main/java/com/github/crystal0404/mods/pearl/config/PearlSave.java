@@ -17,7 +17,9 @@ import net.minecraft.nbt.NbtList;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.World;
 import org.jetbrains.annotations.NotNull;
 
@@ -25,10 +27,18 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Comparator;
 
 public class PearlSave {
     private static Path PATH;
     private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+    // 启动专用票据，有效期 100 tick (5秒)
+    private static final ChunkTicketType<ChunkPos> BOOTSTRAP_TICKET = ChunkTicketType.create(
+            "pearl_bootstrap",
+            Comparator.comparingLong(ChunkPos::toLong),
+            100
+    );
 
     public static void init() {
         ServerLifecycleEvents.SERVER_STARTING.register(
@@ -74,66 +84,71 @@ public class PearlSave {
     }
 
     public static void loadEnderPearls(ServerPlayerEntity serverPlayerEntity) throws IOException {
+        System.out.println("PEARL_DEBUG: loadEnderPearls called for " + serverPlayerEntity.getName().getString());
         NbtCompound nbt = getNbt();
         NbtList nbtList = nbt.getList(serverPlayerEntity.getUuid().toString(), NbtElement.COMPOUND_TYPE);
+        
         if (!nbtList.isEmpty()) {
+            System.out.println("PEARL_DEBUG: Found " + nbtList.size() + " pearls to load.");
             nbtList.forEach(nbtElement -> {
                 if (nbtElement instanceof NbtCompound nbtCompound) {
-                    loadEnderPearl(serverPlayerEntity, nbtCompound);
+                    try {
+                        loadEnderPearl(serverPlayerEntity, nbtCompound);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
                 }
             });
+        } else {
+            System.out.println("PEARL_DEBUG: No pearls found in storage for this player.");
         }
     }
 
-    private static void loadEnderPearl(
-            ServerPlayerEntity serverPlayerEntity,
-            NbtCompound nbtCompound
-    ) {
-        RegistryKey<World> world = World.CODEC.parse(NbtOps.INSTANCE, nbtCompound.get("ender_pearl_dimension")).getOrThrow();
-        ServerWorld serverWorld = serverPlayerEntity.getServerWorld().getServer().getWorld(world);
+    private static void loadEnderPearl(ServerPlayerEntity serverPlayerEntity, NbtCompound nbtCompound) {
+        RegistryKey<World> worldKey = World.CODEC.parse(NbtOps.INSTANCE, nbtCompound.get("ender_pearl_dimension")).getOrThrow();
+        ServerWorld serverWorld = serverPlayerEntity.getServerWorld().getServer().getWorld(worldKey);
+        
         if (serverWorld != null) {
-            // 1. 反序列化实体，但不立即加入世界
+            // 1. 反序列化实体
             Entity entity = EntityType.loadEntityWithPassengers(
                     nbtCompound, serverWorld, entity1 -> entity1
             );
             
             if (entity != null) {
-                // [关键修复]：手动设置主人为当前正在登录的玩家。
-                // 否则，因为玩家此时还不在服务器的全局列表中，pearl.getOwner() 会返回 null，
-                // 导致 Mixin 中的票据续期逻辑失效。
+                // 2. 设置主人
                 if (entity instanceof EnderPearlEntity enderPearl) {
                     enderPearl.setOwner(serverPlayerEntity);
                 }
 
-                // 2. 添加票据并强制加载区块
-                ChunkUtils.addEnderPearlTicket(serverWorld, entity.getChunkPos());
-                serverWorld.getChunk(entity.getChunkPos().x, entity.getChunkPos().z);
+                ChunkPos chunkPos = entity.getChunkPos();
+                System.out.println("PEARL_DEBUG: Loading pearl at " + chunkPos + " in " + worldKey.getValue());
 
-                // 3. 将实体加入世界
+                // 3. 添加强效启动票据 (5秒)
+                serverWorld.getChunkManager().addTicket(BOOTSTRAP_TICKET, chunkPos, 2, chunkPos);
+                // 添加普通续期票据
+                ChunkUtils.addEnderPearlTicket(serverWorld, chunkPos);
+
+                // 4. 强制加载区块
+                serverWorld.getChunk(chunkPos.x, chunkPos.z);
+
+                // 5. 添加实体
                 if (!serverWorld.tryLoadEntity(entity)) {
-                    // 如果标准加载失败（极少见），尝试强制添加
                     if (!serverWorld.entityList.has(entity)) {
                         serverWorld.entityList.add(entity);
+                        System.out.println("PEARL_DEBUG: FORCE ADDED pearl entity.");
+                        PearlChunkLoadingMod.LOGGER.info("Force loaded pearl in {} at {}", worldKey.getValue(), chunkPos);
                     } else {
-                        PearlChunkLoadingMod.LOGGER.warn(
-                            "Failed to spawn player ender pearl in level ({})",
-                            world
-                        );
+                        System.out.println("PEARL_DEBUG: Entity already in list.");
                     }
+                } else {
+                    System.out.println("PEARL_DEBUG: Standard load success.");
                 }
             } else {
-                PearlChunkLoadingMod.LOGGER.warn(
-                        "Failed to deserialize player ender pearl in level ({}), skipping",
-                        world
-                );
+                System.out.println("PEARL_DEBUG: Failed to deserialize entity.");
             }
         } else {
-            PearlChunkLoadingMod.LOGGER.warn(
-                    "Trying to load ender pearl without level ({}) being loaded, skipping",
-                    world
-            );
+            System.out.println("PEARL_DEBUG: World " + worldKey.getValue() + " not found.");
         }
-
     }
 
     private static @NotNull NbtCompound getNbt() throws IOException {
