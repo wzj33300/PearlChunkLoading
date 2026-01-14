@@ -92,17 +92,33 @@ public class PearlSave {
         RegistryKey<World> world = World.CODEC.parse(NbtOps.INSTANCE, nbtCompound.get("ender_pearl_dimension")).getOrThrow();
         ServerWorld serverWorld = serverPlayerEntity.getServerWorld().getServer().getWorld(world);
         if (serverWorld != null) {
+            // 修改点 1: 回调函数只返回实体，不进行 tryLoadEntity 操作，防止因区块未加载而失败
             Entity entity = EntityType.loadEntityWithPassengers(
-                    nbtCompound, serverWorld, entity1 -> !serverWorld.tryLoadEntity(entity1) ? null : entity1
+                    nbtCompound, serverWorld, entity1 -> entity1
             );
+            
             if (entity != null) {
+                // 修改点 2: 先添加 Ticket，通知服务器加载区块
                 ChunkUtils.addEnderPearlTicket(serverWorld, entity.getChunkPos());
-                if (!serverWorld.entityList.has(entity)) {
-                    serverWorld.entityList.add(entity);
+                
+                // 修改点 3: 显式获取区块，确保区块已加载，为添加实体做准备
+                serverWorld.getChunk(entity.getChunkPos().x, entity.getChunkPos().z);
+
+                // 修改点 4: 此时区块已加载，安全地将实体添加到世界
+                if (!serverWorld.tryLoadEntity(entity)) {
+                    // 如果标准添加失败，尝试作为 fallback 手动添加（保留原作者的部分逻辑，但通常 tryLoadEntity 应该成功）
+                    if (!serverWorld.entityList.has(entity)) {
+                        serverWorld.entityList.add(entity);
+                    } else {
+                        PearlChunkLoadingMod.LOGGER.warn(
+                            "Failed to spawn player ender pearl in level ({})",
+                            world
+                        );
+                    }
                 }
             } else {
                 PearlChunkLoadingMod.LOGGER.warn(
-                        "Failed to spawn player ender pearl in level ({}), skipping",
+                        "Failed to deserialize player ender pearl in level ({}), skipping",
                         world
                 );
             }
